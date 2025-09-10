@@ -146,6 +146,19 @@ defmodule Asciinema.Recordings do
     :ok
   end
 
+  def create_asciicast(user, gcs_uri, fields \\ %{}) when is_binary(gcs_uri) do
+    with {:ok, {bucket, object}} <- parse_gcs_uri(gcs_uri),
+         {:ok, tmp_path} <- download_gcs_object(bucket, object) do
+      upload = %Plug.Upload{
+        path: tmp_path,
+        filename: Path.basename(object),
+        content_type: "application/octet-stream"
+      }
+
+      create_asciicast(user, upload, fields)
+    end
+  end
+
   def create_asciicast(user, %Plug.Upload{filename: filename} = upload, fields \\ %{}) do
     attrs =
       Map.merge(
@@ -173,6 +186,19 @@ defmodule Asciinema.Recordings do
 
       {:ok, asciicast}
     end
+  end
+
+  defp parse_gcs_uri("gs://" <> rest) do
+    case String.split(rest, "/", parts: 2) do
+      [bucket, object] -> {:ok, {bucket, object}}
+      _ -> {:error, :invalid_gcs_uri}
+    end
+  end
+
+  defp parse_gcs_uri(_), do: {:error, :invalid_gcs_uri}
+
+  defp download_gcs_object(bucket, object) do
+    Asciinema.GCS.download_gcs_object(bucket, object)
   end
 
   defp extract_metadata(%Plug.Upload{path: path}) do

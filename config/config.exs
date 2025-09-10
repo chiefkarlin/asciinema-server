@@ -83,8 +83,32 @@ config :sentry,
   tags: %{env: config_env()},
   in_app_module_allow_list: [Asciinema]
 
-config :asciinema, Asciinema.FileStore, adapter: Asciinema.FileStore.Local
+file_store = System.get_env("FILE_STORE")
+
+cond do
+  file_store == "S3" ->
+    config :asciinema, Asciinema.FileStore, adapter: Asciinema.FileStore.S3
+
+  file_store == "GCS" ->
+    config :asciinema, Asciinema.FileStore, adapter: Asciinema.FileStore.GCS
+
+  true ->
+    config :asciinema, Asciinema.FileStore, adapter: Asciinema.FileStore.Local
+end
+
 config :asciinema, Asciinema.FileStore.Local, path: "uploads/"
+
+config :asciinema, Asciinema.FileStore.S3,
+  bucket: System.get_env("AWS_S3_BUCKET"),
+  path: System.get_env("AWS_S3_PATH")
+
+config :asciinema, Asciinema.FileStore.GCS,
+  bucket: System.get_env("GCS_BUCKET"),
+  path: System.get_env("GCS_PATH")
+
+if System.get_env("GCS_SERVICE_ACCOUNT_JSON_PATH") do
+  config :goth, json: File.read!(System.get_env("GCS_SERVICE_ACCOUNT_JSON_PATH"))
+end
 
 config :asciinema, Asciinema.FileCache, path: "cache/"
 
