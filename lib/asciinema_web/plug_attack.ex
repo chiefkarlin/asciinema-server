@@ -42,7 +42,12 @@ defmodule AsciinemaWeb.PlugAttack do
 
   rule "throttle recording creation", conn do
     if conn.method == "POST" and
-         conn.path_info in [["api", "v1", "recordings"], ["api", "asciicasts"]] do
+         (conn.path_info in [
+            ["api", "v1", "recordings"],
+            ["api", "asciicasts"],
+            ["api", "v1", "recordings", "uploads", "complete"]
+          ] or
+            match?(["api", "v1", "recordings", "uploads", _, "complete"], conn.path_info)) do
       throttle({:create_recording, conn.remote_ip}, limit_for(:create_recording))
     end
   end

@@ -570,14 +570,68 @@ defmodule Asciinema.Recordings do
          :ok <- validate_not_empty(metadata),
          metadata = Map.put(metadata, :filename, normalize_filename(params)),
          changeset = build_asciicast(user, attrs, metadata, params),
+         :ok <- validate_asciicast(changeset) do
+      if FileStore.direct_download_supported?() do
+        changeset =
+          change(changeset, %{
+            uncompressed_size: file_size(local_path),
+            compressed_size: nil,
+            compressed: false
+          })
+
+        with {store_path, changeset} <- assign_store_path(changeset),
+             :ok <- save_file(local_path, store_path),
+             {:ok, asciicast} <- insert_asciicast_or_delete_file(changeset, store_path),
+             :ok <- schedule_bg_jobs(asciicast) do
+          {:ok, asciicast}
+        end
+      else
+        {compressed_path, changeset} = compress_file(local_path, changeset)
+
+        try do
+          with {store_path, changeset} <- assign_store_path(changeset),
+               :ok <- save_file(compressed_path, store_path),
+               {:ok, asciicast} <- insert_asciicast_or_delete_file(changeset, store_path),
+               :ok <- schedule_bg_jobs(asciicast) do
+            {:ok, asciicast}
+          end
+        after
+          _ = File.rm(compressed_path)
+        end
+      end
+    end
+  end
+
+  def create_asciicast_from_store(user, staged_store_path, attrs \\ %{}, params \\ %{})
+      when is_binary(staged_store_path) do
+    with {:ok, %{size: byte_size}} <- FileStore.stat_file(staged_store_path),
+         {:ok, chunk_stream} <- FileStore.open_stream(staged_store_path),
+         {:ok, metadata} <- extract_metadata_from_stream(chunk_stream),
+         :ok <- validate_not_empty(metadata),
+         metadata = Map.put(metadata, :filename, normalize_filename(params)),
+         changeset = build_asciicast(user, attrs, metadata, params),
+         changeset =
+           change(changeset, %{
+             uncompressed_size: byte_size,
+             compressed_size: nil,
+             compressed: false
+           }),
          :ok <- validate_asciicast(changeset),
-         {compressed_path, changeset} = compress_file(local_path, changeset),
-         {store_path, changeset} = assign_store_path(changeset),
-         :ok <- save_file(compressed_path, store_path),
-         {:ok, asciicast} <- insert_asciicast_or_delete_file(changeset, store_path),
+         {store_path, changeset} <- assign_store_path(changeset),
+         {:ok, asciicast} <-
+           insert_and_move_from_store(changeset, staged_store_path, store_path),
          :ok <- schedule_bg_jobs(asciicast) do
       {:ok, asciicast}
     end
+  end
+
+  defp insert_and_move_from_store(changeset, staged_store_path, store_path) do
+    Repo.transact(fn ->
+      with {:ok, asciicast} <- Repo.insert(changeset),
+           :ok <- FileStore.move_file(staged_store_path, store_path) do
+        {:ok, asciicast}
+      end
+    end)
   end
 
   defp build_asciicast(user, attrs, metadata, params) do
@@ -696,16 +750,121 @@ defmodule Asciinema.Recordings do
     File.stat!(path).size
   end
 
-  defp extract_metadata(path) when is_binary(path) do
+  def extract_metadata(path) when is_binary(path) do
     if Reader.compressed?(path) do
       {:error, :invalid_format}
     else
-      case V2.fetch_metadata(path) do
-        {:ok, metadata} -> {:ok, metadata}
-        {:error, {:invalid_version, 3}} -> V3.fetch_metadata(path)
-        {:error, {:invalid_version, _} = reason} -> {:error, reason}
-        {:error, :invalid_format} -> V1.fetch_metadata(path)
-      end
+      path
+      |> Reader.stream_lines!(compressed: false)
+      |> do_extract_metadata_from_lines()
+    end
+  rescue
+    Zstd.LineTooLongError -> {:error, :invalid_format}
+    RuntimeError -> {:error, :invalid_format}
+  end
+
+  def extract_metadata_from_stream(chunk_enum, _byte_size \\ nil) do
+    chunk_enum
+    |> Reader.stream_lines!(compressed: false)
+    |> do_extract_metadata_from_lines()
+  rescue
+    Zstd.LineTooLongError -> {:error, :invalid_format}
+    RuntimeError -> {:error, :invalid_format}
+  end
+
+  defp do_extract_metadata_from_lines(lines) do
+    result =
+      Enum.reduce_while(lines, :init, fn
+        line, :init ->
+          if Reader.compressed_magic?(line) do
+            {:halt, {:error, :invalid_format}}
+          else
+            case Jason.decode(line) do
+              {:ok, %{"version" => 2}} ->
+                case V2.parse_header_line(line) do
+                  {:ok, header} ->
+                    {:cont, {:v2, header, header["idle_time_limit"], 0, 0, 0}}
+
+                  {:error, _} = err ->
+                    {:halt, err}
+                end
+
+              {:ok, %{"version" => 3}} ->
+                case V3.parse_header_line(line) do
+                  {:ok, header} ->
+                    {:cont, {:v3, header, header["idle_time_limit"], 0, 0}}
+
+                  {:error, _} = err ->
+                    {:halt, err}
+                end
+
+              {:ok, %{"version" => 1}} ->
+                {:halt, V1.fetch_metadata_from_json(line)}
+
+              {:ok, %{"version" => version}} ->
+                {:halt, {:error, {:invalid_version, version}}}
+
+              {:ok, _} ->
+                {:halt, {:error, :invalid_format}}
+
+              {:error, %Jason.DecodeError{}} ->
+                if String.starts_with?(String.trim_leading(line), "{") and
+                     byte_size(line) <= V1.max_v1_size() do
+                  {:cont, {:v1_lines, [line], byte_size(line)}}
+                else
+                  {:halt, {:error, :invalid_format}}
+                end
+            end
+          end
+
+        line, {:v2, header, idle_time_limit, prev_time, abs_time, count} ->
+          case V2.reduce_event_line(line, idle_time_limit, prev_time, abs_time, count) do
+            {:ok, next_prev_time, next_abs_time, next_count} ->
+              {:cont, {:v2, header, idle_time_limit, next_prev_time, next_abs_time, next_count}}
+
+            {:error, _} = err ->
+              {:halt, err}
+          end
+
+        line, {:v3, header, idle_time_limit, abs_time, count} ->
+          case V3.reduce_event_line(line, idle_time_limit, abs_time, count) do
+            {:ok, next_abs_time, next_count} ->
+              {:cont, {:v3, header, idle_time_limit, next_abs_time, next_count}}
+
+            {:error, _} = err ->
+              {:halt, err}
+          end
+
+        line, {:v1_lines, acc, total_bytes} ->
+          new_total = total_bytes + byte_size(line)
+
+          if new_total > V1.max_v1_size() do
+            {:halt, {:error, :invalid_format}}
+          else
+            {:cont, {:v1_lines, [line | acc], new_total}}
+          end
+      end)
+
+    case result do
+      :init ->
+        {:error, :invalid_format}
+
+      {:v2, header, _idle_time_limit, _prev_time, abs_time, count} ->
+        {:ok, V2.build_metadata(header, %{duration: abs_time / 1, event_count: count})}
+
+      {:v3, header, _idle_time_limit, abs_time, count} ->
+        {:ok, V3.build_metadata(header, %{duration: abs_time / 1, event_count: count})}
+
+      {:v1_lines, acc, _total_bytes} ->
+        acc
+        |> Enum.reverse()
+        |> V1.fetch_metadata_from_json()
+
+      {:ok, _} = ok ->
+        ok
+
+      {:error, _} = err ->
+        err
     end
   end
 
@@ -911,19 +1070,23 @@ defmodule Asciinema.Recordings do
     old_store_path = asciicast.path
     source_path = get_cast_path!(asciicast)
     {zst_path, changeset} = compress_file(source_path, asciicast)
-    {new_store_path, changeset} = assign_store_path(changeset)
-    :ok = save_file(zst_path, new_store_path)
-    _ = File.rm(zst_path)
 
     try do
-      asciicast = Repo.update!(changeset)
-      maybe_delete_file(old_store_path)
+      {new_store_path, changeset} = assign_store_path(changeset)
+      :ok = save_file(zst_path, new_store_path)
 
-      {:ok, asciicast}
-    rescue
-      error ->
-        maybe_delete_file(new_store_path)
-        reraise error, __STACKTRACE__
+      try do
+        asciicast = Repo.update!(changeset)
+        maybe_delete_file(old_store_path)
+
+        {:ok, asciicast}
+      rescue
+        error ->
+          maybe_delete_file(new_store_path)
+          reraise error, __STACKTRACE__
+      end
+    after
+      _ = File.rm(zst_path)
     end
   end
 
@@ -1028,13 +1191,24 @@ defmodule Asciinema.Recordings do
   end
 
   def event_stream(%Asciicast{} = asciicast) do
-    path = get_cast_path!(asciicast)
     opts = [compressed: asciicast.compressed]
 
     case asciicast.version do
-      1 -> V1.event_stream(path, opts)
-      2 -> V2.event_stream(path, opts)
-      3 -> V3.event_stream(path, opts)
+      1 ->
+        path = get_cast_path!(asciicast)
+        V1.event_stream(path, opts)
+
+      version when version in [2, 3] ->
+        source =
+          case FileStore.open_stream(asciicast.path) do
+            {:ok, stream} -> {:stream, stream}
+            _ -> get_cast_path!(asciicast)
+          end
+
+        case version do
+          2 -> V2.event_stream(source, opts)
+          3 -> V3.event_stream(source, opts)
+        end
     end
   end
 
@@ -1288,6 +1462,20 @@ defmodule Asciinema.Recordings do
   def verify_view_count_token(token) do
     Phoenix.Token.verify(AsciinemaWeb.Endpoint, "view-count", token,
       max_age: @view_count_token_max_age
+    )
+  end
+
+  # Direct upload token - valid for 24 hours
+  @direct_upload_token_salt "direct-upload"
+  @direct_upload_token_max_age 3600 * 24
+
+  def generate_direct_upload_token(data) do
+    Phoenix.Token.sign(AsciinemaWeb.Endpoint, @direct_upload_token_salt, data)
+  end
+
+  def verify_direct_upload_token(token) do
+    Phoenix.Token.verify(AsciinemaWeb.Endpoint, @direct_upload_token_salt, token,
+      max_age: @direct_upload_token_max_age
     )
   end
 end

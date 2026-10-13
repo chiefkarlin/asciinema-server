@@ -46,6 +46,19 @@ defmodule AsciinemaWeb.Api.RecordingJSON do
 
       :account_required ->
         %{type: "account_required", message: "This action requires an account"}
+
+      :invalid_upload_token ->
+        %{type: "validation_failed", message: "Invalid or expired upload token"}
+
+      :upload_not_found ->
+        %{type: "validation_failed", message: "Uploaded recording object not found in storage"}
+
+      :direct_upload_unsupported ->
+        %{
+          mode: "multipart",
+          type: "direct_upload_unsupported",
+          message: "Direct upload is not supported by the active storage backend"
+        }
     end
     |> Map.merge(Map.take(assigns, [:message]))
   end

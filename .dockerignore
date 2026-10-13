@@ -6,11 +6,14 @@ assets/node_modules
 cache
 deps
 docs
+native/target
+native/**/.cargo
 native/vt_nif/.cargo
 native/vt_nif/target
 priv/native
 priv/static/assets
 priv/static/cache_manifest.json
 test
+tmp
 uploads
 volumes

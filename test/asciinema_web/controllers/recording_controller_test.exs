@@ -1255,6 +1255,55 @@ defmodule AsciinemaWeb.RecordingControllerTest do
     end
   end
 
+  describe "direct-from-GCS playback and download redirects (R3)" do
+    setup [:insert_public_recording]
+
+    test "redirects .cast and .json requests with 302 Found to V4 signed GCS URL when GCS FileStore is active",
+         %{conn: conn, asciicast: asciicast} do
+      rsa_key = :public_key.generate_key({:rsa, 2048, 65537})
+      pem = :public_key.pem_encode([:public_key.pem_entry_encode(:RSAPrivateKey, rsa_key)])
+
+      Asciinema.AppEnv.put(Asciinema.FileStore, adapter: Asciinema.FileStore.GCS)
+
+      Asciinema.AppEnv.put(Asciinema.FileStore.GCS,
+        bucket: "playback-bucket",
+        path: "uploads/",
+        storage_base_url: "https://storage.googleapis.com",
+        credentials: %{
+          "client_email" => "playback@example.com",
+          "private_key" => pem
+        }
+      )
+
+      # 1. Playback GET /a/:id.cast -> 302 to signed GCS URL without Content-Disposition attachment
+      cast_conn = get(conn, ~p"/a/#{asciicast.id}" <> ".cast")
+      signed_cast_url = redirected_to(cast_conn, 302)
+
+      assert ["*"] = get_resp_header(cast_conn, "access-control-allow-origin")
+      assert ["private, max-age=300"] = get_resp_header(cast_conn, "cache-control")
+
+      uri = URI.parse(signed_cast_url)
+      assert uri.host == "storage.googleapis.com"
+      assert uri.path =~ "/playback-bucket/uploads/"
+      query = URI.decode_query(uri.query)
+      assert query["X-Goog-Algorithm"] == "GOOG4-RSA-SHA256"
+      assert query["response-content-type"] == "application/x-asciicast"
+      refute Map.has_key?(query, "response-content-disposition")
+
+      # 2. Download GET /a/:id.cast?dl=1 -> 302 to signed GCS URL with response-content-disposition attachment
+      dl_conn = get(conn, ~p"/a/#{asciicast.id}" <> ".cast?dl=1")
+      signed_dl_url = redirected_to(dl_conn, 302)
+      dl_query = URI.decode_query(URI.parse(signed_dl_url).query)
+      assert dl_query["response-content-disposition"] =~ ~s(attachment; filename="#{asciicast.id}.cast")
+
+      # 3. V1 .json format GET /a/:id.json -> 302 to signed GCS URL with application/x-asciicast
+      json_conn = get(conn, ~p"/a/#{asciicast.id}" <> ".json")
+      signed_json_url = redirected_to(json_conn, 302)
+      json_query = URI.decode_query(URI.parse(signed_json_url).query)
+      assert json_query["response-content-type"] == "application/x-asciicast"
+    end
+  end
+
   defp insert_public_recording(context) do
     [asciicast: insert_recording(:public, context)]
   end

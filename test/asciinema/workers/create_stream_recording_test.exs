@@ -107,6 +107,45 @@ defmodule Asciinema.Workers.CreateStreamRecordingTest do
       assert [] = asciicasts_for(user)
       refute file_in_store?(staging_path)
     end
+
+    test "finalizes a staged live stream recording directly in GCS FileStore without local disk download" do
+      rsa_key = :public_key.generate_key({:rsa, 2048, 65537})
+      pem = :public_key.pem_encode([:public_key.pem_entry_encode(:RSAPrivateKey, rsa_key)])
+      %{base_url: base_url} = Asciinema.GcsTestHelpers.start_mock_gcs()
+
+      Asciinema.AppEnv.put(FileStore, adapter: FileStore.GCS)
+
+      Asciinema.AppEnv.put(FileStore.GCS,
+        bucket: "stream-test-bucket",
+        path: "uploads/",
+        storage_base_url: base_url,
+        access_token: "stream-test-token",
+        credentials: %{"client_email" => "test@example.com", "private_key" => pem}
+      )
+
+      user = insert(:user)
+      stream = insert(:stream, user: user)
+      staging_path = stage_cast(stream.id)
+
+      args = %{
+        "user_id" => user.id,
+        "stream_id" => stream.id,
+        "file_store_path" => staging_path,
+        "user_agent" => "test/gcs-stream",
+        "term_bold_is_bright" => false,
+        "term_adaptive_palette" => false,
+        "keystroke_overlay" => false,
+        "term_cursor_mode" => "blinking"
+      }
+
+      assert :ok = perform_job(CreateStreamRecording, args)
+
+      assert [%Asciicast{compressed: false, path: final_path} = asciicast] = asciicasts_for(user)
+      assert final_path =~ ~r|^recordings/.+\.cast$|
+      assert asciicast.stream_id == stream.id
+      refute file_in_store?(staging_path)
+      assert file_in_store?(final_path)
+    end
   end
 
   defp asciicasts_for(user) do
@@ -120,7 +159,9 @@ defmodule Asciinema.Workers.CreateStreamRecordingTest do
   end
 
   defp file_in_store?(path) do
-    "file://" <> abs_path = FileStore.uri(path)
-    File.exists?(abs_path)
+    case FileStore.stat_file(path) do
+      {:ok, _} -> true
+      {:error, :enoent} -> false
+    end
   end
 end

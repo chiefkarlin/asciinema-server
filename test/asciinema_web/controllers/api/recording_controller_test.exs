@@ -587,6 +587,205 @@ defmodule AsciinemaWeb.Api.RecordingControllerTest do
     end
   end
 
+  describe "direct-to-GCS upload handshake and completion (R1)" do
+    setup [:authenticate]
+
+    test "returns 422 direct_upload_unsupported when FileStore does not support direct upload", %{
+      conn: conn
+    } do
+      conn =
+        conn
+        |> put_req_header("accept", "application/json")
+        |> post(~p"/api/v1/recordings/uploads", %{"filename" => "test.cast"})
+
+      assert %{"type" => "direct_upload_unsupported", "mode" => "multipart"} =
+               json_response(conn, 422)
+    end
+
+    test "initiates direct upload, accepts PUT to upload_url, and completes recording on both completion routes",
+         %{conn: conn} do
+      rsa_key = :public_key.generate_key({:rsa, 2048, 65537})
+      pem = :public_key.pem_encode([:public_key.pem_entry_encode(:RSAPrivateKey, rsa_key)])
+      %{base_url: base_url} = Asciinema.GcsTestHelpers.start_mock_gcs()
+
+      AppEnv.put(Asciinema.FileStore, adapter: Asciinema.FileStore.GCS)
+
+      AppEnv.put(Asciinema.FileStore.GCS,
+        bucket: "api-direct-bucket",
+        path: "uploads/",
+        storage_base_url: base_url,
+        access_token: "api-direct-token",
+        credentials: %{"client_email" => "api@example.com", "private_key" => pem}
+      )
+
+      # 1. Initiate upload
+      init_conn =
+        conn
+        |> put_req_header("accept", "application/json")
+        |> post(~p"/api/v1/recordings/uploads", %{
+          "filename" => "session.cast",
+          "content_type" => "application/x-asciicast",
+          "byte_size" => 512
+        })
+
+      assert %{
+               "mode" => "direct",
+               "upload_id" => upload_id,
+               "upload_token" => upload_token,
+               "object_key" => object_key,
+               "upload_url" => upload_url,
+               "upload_method" => "PUT",
+               "upload_type" => "resumable",
+               "headers" => %{"Content-Type" => "application/x-asciicast"},
+               "complete_url" => complete_url
+             } = json_response(init_conn, 200)
+
+      assert is_binary(upload_id)
+      assert is_binary(upload_token)
+      assert object_key =~ "tmp/direct-uploads/"
+      assert complete_url =~ "/api/v1/recordings/uploads"
+
+      # 2. Simulate CLI uploading file directly to GCS upload_url
+      cast_payload = File.read!("test/fixtures/3/full.cast")
+
+      {:ok, {{_, 200, _}, _, _}} =
+        :httpc.request(
+          :put,
+          {String.to_charlist(upload_url), [], ~c"application/x-asciicast", cast_payload},
+          [],
+          body_format: :binary
+        )
+
+      # 3. Complete via POST /api/v1/recordings/uploads/complete
+      comp_conn =
+        recycle(init_conn)
+        |> put_req_header("authorization", List.first(get_req_header(conn, "authorization")))
+        |> put_req_header("accept", "application/json")
+        |> post(~p"/api/v1/recordings/uploads/complete", %{
+          "upload_token" => upload_token,
+          "title" => "Direct Resumable Upload",
+          "visibility" => "unlisted"
+        })
+
+      assert %{
+               "id" => id,
+               "url" => url,
+               "file_url" => file_url,
+               "title" => "Direct Resumable Upload",
+               "visibility" => "unlisted",
+               "message" => message
+             } = json_response(comp_conn, 201)
+
+      assert is_integer(id)
+      assert url =~ @recording_url
+      assert file_url =~ ~r/^http.+\.cast$/
+      assert message =~ @successful_response
+
+      asciicast = Recordings.get_asciicast(id)
+      assert asciicast.compressed == false
+      assert asciicast.version == 3
+      assert asciicast.uncompressed_size == byte_size(cast_payload)
+
+      # 4. Also test POST /api/v1/recordings/uploads/:upload_id/complete and token mismatch
+      init_conn2 =
+        recycle(init_conn)
+        |> put_req_header("authorization", List.first(get_req_header(conn, "authorization")))
+        |> put_req_header("accept", "application/json")
+        |> post(~p"/api/v1/recordings/uploads", %{"filename" => "second.cast"})
+
+      assert %{
+               "upload_id" => upload_id2,
+               "upload_token" => upload_token2,
+               "upload_url" => upload_url2
+             } = json_response(init_conn2, 200)
+
+      {:ok, {{_, 200, _}, _, _}} =
+        :httpc.request(
+          :put,
+          {String.to_charlist(upload_url2), [], ~c"application/x-asciicast", cast_payload},
+          [],
+          body_format: :binary
+        )
+
+      # Mismatched upload_id in path vs token fails with 422 validation_failed
+      bad_id_conn =
+        recycle(init_conn2)
+        |> put_req_header("authorization", List.first(get_req_header(conn, "authorization")))
+        |> put_req_header("accept", "application/json")
+        |> post(~p"/api/v1/recordings/uploads/wrong-upload-id/complete", %{
+          "upload_token" => upload_token2
+        })
+
+      assert %{
+               "type" => "validation_failed",
+               "message" => "Invalid or expired upload token"
+             } = json_response(bad_id_conn, 422)
+
+      # Matching upload_id succeeds
+      ok_id_conn =
+        recycle(init_conn2)
+        |> put_req_header("authorization", List.first(get_req_header(conn, "authorization")))
+        |> put_req_header("accept", "application/json")
+        |> post(~p"/api/v1/recordings/uploads/#{upload_id2}/complete", %{
+          "upload_token" => upload_token2
+        })
+
+      assert %{"id" => id2} = json_response(ok_id_conn, 201)
+      assert id2 != id
+    end
+
+    test "rejects completion when object was never uploaded or when called by another user", %{
+      conn: conn
+    } do
+      rsa_key = :public_key.generate_key({:rsa, 2048, 65537})
+      pem = :public_key.pem_encode([:public_key.pem_entry_encode(:RSAPrivateKey, rsa_key)])
+      %{base_url: base_url} = Asciinema.GcsTestHelpers.start_mock_gcs()
+
+      AppEnv.put(Asciinema.FileStore, adapter: Asciinema.FileStore.GCS)
+
+      AppEnv.put(Asciinema.FileStore.GCS,
+        bucket: "api-direct-bucket",
+        path: "uploads/",
+        storage_base_url: base_url,
+        access_token: "api-direct-token",
+        credentials: %{"client_email" => "api@example.com", "private_key" => pem}
+      )
+
+      init_conn =
+        conn
+        |> put_req_header("accept", "application/json")
+        |> post(~p"/api/v1/recordings/uploads", %{"filename" => "missing.cast"})
+
+      assert %{"upload_token" => upload_token} = json_response(init_conn, 200)
+
+      # Without PUTting to GCS, complete returns 422 validation_failed (Uploaded recording object not found)
+      missing_conn =
+        recycle(init_conn)
+        |> put_req_header("authorization", List.first(get_req_header(conn, "authorization")))
+        |> put_req_header("accept", "application/json")
+        |> post(~p"/api/v1/recordings/uploads/complete", %{"upload_token" => upload_token})
+
+      assert %{
+               "type" => "validation_failed",
+               "message" => "Uploaded recording object not found in storage"
+             } = json_response(missing_conn, 422)
+
+      # Another CLI token (different user) cannot use this upload_token
+      other_token = "11111111-2222-3333-4444-555555555555"
+
+      other_conn =
+        recycle(init_conn)
+        |> put_req_header("authorization", "Basic " <> Base.encode64("test:" <> other_token))
+        |> put_req_header("accept", "application/json")
+        |> post(~p"/api/v1/recordings/uploads/complete", %{"upload_token" => upload_token})
+
+      assert %{
+               "type" => "validation_failed",
+               "message" => "Invalid or expired upload token"
+             } = json_response(other_conn, 422)
+    end
+  end
+
   defp upload(conn, upload, params \\ %{}) do
     conn
     |> put_resp_content_type("application/json")

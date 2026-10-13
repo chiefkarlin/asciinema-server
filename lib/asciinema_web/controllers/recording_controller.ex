@@ -1,6 +1,6 @@
 defmodule AsciinemaWeb.RecordingController do
   use AsciinemaWeb, :controller
-  alias Asciinema.{FileCache, Gzip, Recordings, Zstd}
+  alias Asciinema.{FileCache, FileStore, Gzip, Recordings, Zstd}
   alias Asciinema.Recordings.Asciicast
   alias Asciinema.Recordings.Query, as: RecordingQuery
   alias AsciinemaWeb.{Authorization, PlayerOpts, PngGenerator, RecordingSVG}
@@ -10,6 +10,7 @@ defmodule AsciinemaWeb.RecordingController do
   plug :load_and_authorize_asciicast when action in [:show, :edit, :update, :delete, :iframe]
   plug :redirect_to_canonical_path when action == :show
   @encoding_chunk_size 64 * 1024
+  @direct_download_max_age 300
 
   def show(conn, _params) do
     do_show(conn, get_format(conn), conn.assigns.asciicast)
@@ -42,25 +43,42 @@ defmodule AsciinemaWeb.RecordingController do
       send_resp(conn, 410, "")
     else
       filename = attachment_filename(asciicast, conn.params)
-      encoding = preferred_response_encoding(conn)
 
-      case get_cast_path(asciicast, encoding) do
-        {:ok, path} ->
-          conn
-          |> put_resp_header("content-type", "application/x-asciicast")
-          |> put_resp_header("access-control-allow-origin", "*")
-          |> put_resp_header("vary", "accept-encoding")
-          |> maybe_put_content_encoding(encoding)
-          |> put_content_disposition(filename)
-          |> send_file(200, path)
+      if FileStore.direct_download_supported?() do
+        case FileStore.direct_download_url(asciicast.path,
+               filename: filename,
+               response_content_type: "application/x-asciicast"
+             ) do
+          {:ok, signed_url} ->
+            conn
+            |> put_resp_header("access-control-allow-origin", "*")
+            |> put_resp_header("cache-control", "private, max-age=#{@direct_download_max_age}")
+            |> redirect(external: signed_url)
 
-        {:error, %FileCache.Error{type: :timeout}} ->
-          conn
-          |> put_resp_header("retry-after", "5")
-          |> send_resp(503, "")
+          {:error, error} ->
+            raise error
+        end
+      else
+        encoding = preferred_response_encoding(conn)
 
-        {:error, error} ->
-          raise error
+        case get_cast_path(asciicast, encoding) do
+          {:ok, path} ->
+            conn
+            |> put_resp_header("content-type", "application/x-asciicast")
+            |> put_resp_header("access-control-allow-origin", "*")
+            |> put_resp_header("vary", "accept-encoding")
+            |> maybe_put_content_encoding(encoding)
+            |> put_content_disposition(filename)
+            |> send_file(200, path)
+
+          {:error, %FileCache.Error{type: :timeout}} ->
+            conn
+            |> put_resp_header("retry-after", "5")
+            |> send_resp(503, "")
+
+          {:error, error} ->
+            raise error
+        end
       end
     end
   end

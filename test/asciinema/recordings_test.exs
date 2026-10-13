@@ -1343,4 +1343,57 @@ defmodule Asciinema.RecordingsTest do
       assert today_count == base + 3
     end
   end
+
+  describe "create_asciicast_from_store/4 and direct upload tokens (R1/R2)" do
+    test "signs and verifies direct upload tokens bound to user_id and object_key" do
+      payload = %{
+        "upload_id" => "upl-123",
+        "object_key" => "tmp/direct-uploads/upl-123.cast",
+        "user_id" => 42,
+        "cli_id" => 7,
+        "filename" => "demo.cast"
+      }
+
+      token = Recordings.generate_direct_upload_token(payload)
+      assert {:ok, verified} = Recordings.verify_direct_upload_token(token)
+      assert verified["upload_id"] == "upl-123"
+      assert verified["object_key"] == "tmp/direct-uploads/upl-123.cast"
+      assert verified["user_id"] == 42
+
+      assert {:error, :invalid} =
+               Recordings.verify_direct_upload_token("invalid-token")
+    end
+
+    test "creates an asciicast from a staged object in FileStore and moves it to final key" do
+      user = insert(:user)
+      staged_key = "tmp/direct-uploads/test-#{System.unique_integer([:positive])}.cast"
+      :ok = Asciinema.FileStore.put_file(staged_key, "test/fixtures/3/full.cast", "application/x-asciicast")
+
+      assert {:ok, asciicast} =
+               Recordings.create_asciicast_from_store(
+                 user,
+                 staged_key,
+                 %{user_agent: "asciinema/3.0.0"},
+                 %{"filename" => "direct.cast", "title" => "Direct Upload"}
+               )
+
+      assert asciicast.version == 3
+      assert asciicast.compressed == false
+      assert asciicast.filename == "direct.cast"
+      assert asciicast.title == "Direct Upload"
+      assert asciicast.path =~ ~r|^recordings/.+\.cast$|
+
+      # Staged key was moved to final path
+      assert {:error, :enoent} = Asciinema.FileStore.stat_file(staged_key)
+      assert {:ok, %{size: size}} = Asciinema.FileStore.stat_file(asciicast.path)
+      assert size == asciicast.uncompressed_size
+    end
+
+    test "returns {:error, :enoent} when staged object does not exist" do
+      user = insert(:user)
+
+      assert {:error, :enoent} =
+               Recordings.create_asciicast_from_store(user, "tmp/direct-uploads/nonexistent.cast")
+    end
+  end
 end

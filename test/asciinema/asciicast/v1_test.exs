@@ -105,5 +105,24 @@ defmodule Asciinema.Asciicast.V1Test do
 
       assert Enum.take(stream, 2) == [{1.234567, "o", "foo bar"}, {6.913554, "o", "baz qux"}]
     end
+
+    test "supports {:stream, enum} sources and enforces size cap" do
+      raw = File.read!("test/fixtures/1/full.json")
+      chunks = [binary_part(raw, 0, 20), binary_part(raw, 20, byte_size(raw) - 20)]
+
+      assert {:ok, metadata} = V1.fetch_metadata({:stream, chunks})
+      assert metadata.version == 1
+      assert metadata.event_count == 3
+
+      assert Enum.take(V1.event_stream({:stream, chunks}), 2) == [
+               {1.234567, "o", "foo bar"},
+               {6.913554, "o", "baz qux"}
+             ]
+
+      # Oversized stream (> 32 MB) is rejected without OOM
+      big_chunk = :binary.copy(" ", 1024 * 1024)
+      oversized_stream = Stream.repeatedly(fn -> big_chunk end) |> Stream.take(35)
+      assert {:error, :invalid_format} = V1.fetch_metadata({:stream, oversized_stream})
+    end
   end
 end

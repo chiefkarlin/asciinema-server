@@ -2,6 +2,23 @@ defmodule Asciinema.Zstd do
   alias __MODULE__.Stream
 
   @read_chunk_size 64 * 1024
+  @max_line_bytes 16 * 1024 * 1024
+
+  def max_line_bytes, do: @max_line_bytes
+
+  defmodule LineTooLongError do
+    defexception [:message, :max_bytes]
+
+    @impl true
+    def exception(opts) do
+      max_bytes = Keyword.fetch!(opts, :max_bytes)
+
+      %__MODULE__{
+        max_bytes: max_bytes,
+        message: "line exceeds maximum length of #{max_bytes} bytes"
+      }
+    end
+  end
 
   defmodule Stream do
     @enforce_keys [:path, :mode]
@@ -39,6 +56,88 @@ defmodule Asciinema.Zstd do
     raise ArgumentError,
           "expected chunk_size to be a positive integer or :line, got: #{inspect(chunk_size)}"
   end
+
+  @spec decompress_stream(Enumerable.t()) :: Enumerable.t()
+  def decompress_stream(chunk_enum) do
+    Elixir.Stream.concat(chunk_enum, [:eof])
+    |> Elixir.Stream.transform(
+      fn ->
+        case :zstd.context(:decompress) do
+          {:ok, context} ->
+            %{context: context}
+
+          {:error, reason} ->
+            raise RuntimeError,
+                  "failed to initialize zstd decompressor for stream: #{inspect(reason)}"
+        end
+      end,
+      fn
+        :eof, state ->
+          decompressed = finish!(state.context, <<>>, "stream", :decompress)
+          items = if decompressed == <<>>, do: [], else: [decompressed]
+          {items, state}
+
+        chunk, state when is_binary(chunk) ->
+          decompressed = stream!(state.context, chunk, "stream", :decompress)
+          items = if decompressed == <<>>, do: [], else: [decompressed]
+          {items, state}
+      end,
+      fn state ->
+        safe_close(state.context)
+      end
+    )
+  end
+
+  @spec decompress_stream_lines(Enumerable.t(), keyword() | pos_integer()) :: Enumerable.t()
+  def decompress_stream_lines(chunk_enum, opts \\ [])
+
+  def decompress_stream_lines(chunk_enum, max_line_bytes)
+      when is_integer(max_line_bytes) and max_line_bytes > 0 do
+    decompress_stream_lines(chunk_enum, max_line_bytes: max_line_bytes)
+  end
+
+  def decompress_stream_lines(chunk_enum, opts) when is_list(opts) do
+    max_line_bytes = Keyword.get(opts, :max_line_bytes, @max_line_bytes)
+
+    Elixir.Stream.concat(chunk_enum, [:eof])
+    |> Elixir.Stream.transform(
+      fn ->
+        case :zstd.context(:decompress) do
+          {:ok, context} ->
+            %{context: context, buffer: <<>>, max_line_bytes: max_line_bytes}
+
+          {:error, reason} ->
+            raise RuntimeError,
+                  "failed to initialize zstd decompressor for stream: #{inspect(reason)}"
+        end
+      end,
+      fn
+        :eof, state ->
+          decompressed = finish!(state.context, <<>>, "stream", :decompress)
+          buffer = state.buffer <> decompressed
+
+          case extract_lines(buffer, true, state.max_line_bytes) do
+            {:emit, lines, rest} -> {lines, %{state | buffer: rest}}
+            :halt -> {[], %{state | buffer: <<>>}}
+          end
+
+        chunk, state when is_binary(chunk) ->
+          decompressed = stream!(state.context, chunk, "stream", :decompress)
+          buffer = state.buffer <> decompressed
+
+          case extract_lines(buffer, false, state.max_line_bytes) do
+            {:emit, lines, rest} -> {lines, %{state | buffer: rest}}
+            :need_more -> {[], %{state | buffer: buffer}}
+          end
+      end,
+      fn state ->
+        safe_close(state.context)
+      end
+    )
+  end
+
+  def decompress_chunk!(context, chunk), do: stream!(context, chunk, "stream", :decompress)
+  def finish_decompress!(context), do: finish!(context, <<>>, "stream", :decompress)
 
   def reader_resource(%Stream{} = stream) do
     Elixir.Stream.resource(
@@ -161,25 +260,45 @@ defmodule Asciinema.Zstd do
     end
   end
 
-  defp extract_lines(<<>>, true), do: :halt
+  def extract_lines(buffer, eof?, max_line_bytes \\ @max_line_bytes)
 
-  defp extract_lines(buffer, eof?) do
+  def extract_lines(<<>>, true, _max_line_bytes), do: :halt
+
+  def extract_lines(buffer, eof?, max_line_bytes) do
     case :binary.matches(buffer, "\n") do
       [] when eof? ->
+        if byte_size(buffer) > max_line_bytes do
+          raise LineTooLongError, max_bytes: max_line_bytes
+        end
+
         {:emit, [buffer], <<>>}
 
       [] ->
+        if byte_size(buffer) > max_line_bytes do
+          raise LineTooLongError, max_bytes: max_line_bytes
+        end
+
         :need_more
 
       newline_positions ->
         {lines, start} =
           Enum.reduce(newline_positions, {[], 0}, fn {index, 1}, {lines, start} ->
-            line = :binary.part(buffer, start, index + 1 - start)
+            line_len = index + 1 - start
+
+            if line_len > max_line_bytes do
+              raise LineTooLongError, max_bytes: max_line_bytes
+            end
+
+            line = :binary.part(buffer, start, line_len)
             {[line | lines], index + 1}
           end)
 
         lines = Enum.reverse(lines)
         rest = :binary.part(buffer, start, byte_size(buffer) - start)
+
+        if byte_size(rest) > max_line_bytes do
+          raise LineTooLongError, max_bytes: max_line_bytes
+        end
 
         if eof? and rest != <<>> do
           {:emit, lines ++ [rest], <<>>}

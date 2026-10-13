@@ -124,6 +124,9 @@ defmodule AsciinemaWeb.Router do
     pipe_through :api
 
     scope "/v1" do
+      post "/recordings/uploads", RecordingController, :initiate_upload
+      post "/recordings/uploads/complete", RecordingController, :complete_upload
+      post "/recordings/uploads/:upload_id/complete", RecordingController, :complete_upload
       resources "/recordings", RecordingController, only: [:create, :update, :delete]
       resources "/streams", StreamController, only: [:create, :update, :delete]
 

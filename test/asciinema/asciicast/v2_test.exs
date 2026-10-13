@@ -178,6 +178,33 @@ defmodule Asciinema.Asciicast.V2Test do
                {4.84567, "o", "baz qux"}
              ]
     end
+
+    test "supports {:stream, enum} sources (plain and zstd-compressed)" do
+      raw = File.read!("test/fixtures/2/full.cast")
+      chunks = for <<chunk::binary-size(19) <- raw>>, do: chunk
+      rem_bytes = rem(byte_size(raw), 19)
+
+      chunks =
+        if rem_bytes > 0 do
+          chunks ++ [binary_part(raw, byte_size(raw) - rem_bytes, rem_bytes)]
+        else
+          chunks
+        end
+
+      assert {:ok, meta} = V2.fetch_metadata({:stream, chunks})
+      assert meta.event_count == 5
+      assert meta.duration == 7.34567
+
+      assert Enum.take(V2.event_stream({:stream, chunks}), 2) == [
+               {1.234567, "o", "foo bar"},
+               {2.0, "r", {80, 24}}
+             ]
+
+      zstd_bytes = IO.iodata_to_binary(:zstd.compress(raw))
+      zstd_chunks = [binary_part(zstd_bytes, 0, 10), binary_part(zstd_bytes, 10, byte_size(zstd_bytes) - 10)]
+      assert {:ok, zstd_meta} = V2.fetch_metadata({:stream, zstd_chunks})
+      assert zstd_meta == meta
+    end
   end
 
   describe "create/3" do

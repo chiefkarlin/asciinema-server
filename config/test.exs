@@ -7,7 +7,8 @@ config :asciinema, Asciinema.Repo,
   database: "asciinema_test#{System.get_env("MIX_TEST_PARTITION")}",
   hostname: "localhost",
   pool: Ecto.Adapters.SQL.Sandbox,
-  pool_size: 10
+  pool_size: 32,
+  queue_target: 5_000
 
 # In test we don't send emails.
 config :asciinema, Asciinema.Emails.Mailer, adapter: Swoosh.Adapters.Test

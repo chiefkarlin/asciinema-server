@@ -64,6 +64,17 @@ defmodule AsciinemaWeb.PlugAttackTest do
     assert get_resp_header(conn, "x-ratelimit-remaining") == ["0"]
   end
 
+  test "throttles direct upload completion endpoints under create_recording bucket without double-penalizing initiate" do
+    ip = unique_ip()
+    assert_allowed("POST", "/api/v1/recordings/uploads", ip)
+    assert_allowed("POST", "/api/v1/recordings/uploads/complete", ip)
+    assert_allowed("POST", "/api/v1/recordings/uploads/upl-123/complete", ip)
+
+    conn = request("POST", "/api/v1/recordings/uploads/complete", ip)
+    assert conn.status == 429
+    assert conn.resp_body == "Too Many Requests\n"
+  end
+
   test "throttles stream creation across both endpoints" do
     ip = unique_ip()
     assert_allowed("POST", "/user/streams", ip)

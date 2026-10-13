@@ -352,17 +352,20 @@ defmodule Asciinema.Streaming.StreamServer do
 
     file_store_path = staging_path(state.stream_id)
 
-    with :ok <-
-           FileStore.put_file(file_store_path, state.path, "application/x-asciicast") do
-      enqueue_finalization(state, file_store_path)
-      File.rm(state.path)
-      Logger.info("stream/#{state.stream_id}: capture staged at #{file_store_path}")
-    else
-      {:error, reason} ->
-        Logger.error(
-          "stream/#{state.stream_id}: failed to finalize capture (#{inspect(reason)}); " <>
-            "local=#{state.path}, staged=#{file_store_path}"
-        )
+    try do
+      case FileStore.put_file(file_store_path, state.path, "application/x-asciicast") do
+        :ok ->
+          enqueue_finalization(state, file_store_path)
+          Logger.info("stream/#{state.stream_id}: capture staged at #{file_store_path}")
+
+        {:error, reason} ->
+          Logger.error(
+            "stream/#{state.stream_id}: failed to finalize capture (#{inspect(reason)}); " <>
+              "local=#{state.path}, staged=#{file_store_path}"
+          )
+      end
+    after
+      _ = File.rm(state.path)
     end
 
     %{state | path: nil, writer: nil}

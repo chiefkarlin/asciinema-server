@@ -3,12 +3,22 @@ defmodule Asciinema.Recordings.Text do
   alias Asciinema.Recordings.Asciicast
   alias Asciinema.Vt
 
-  def text(%Asciicast{term_cols: cols, term_rows: rows} = asciicast) do
-    {:ok, vt} = Vt.new(cols, rows, nil)
+  @default_scrollback_limit 10_000
 
+  def default_scrollback_limit, do: @default_scrollback_limit
+
+  def text(%Asciicast{term_cols: cols, term_rows: rows} = asciicast, opts \\ [])
+      when is_list(opts) do
     asciicast
     |> Recordings.event_stream()
-    |> Enum.each(fn {_, code, data} ->
+    |> text_from_events(cols, rows, opts)
+  end
+
+  def text_from_events(events, cols, rows, opts \\ []) when is_list(opts) do
+    scrollback_limit = Keyword.get(opts, :scrollback_limit, @default_scrollback_limit)
+    {:ok, vt} = Vt.new(cols, rows, scrollback_limit)
+
+    Enum.each(events, fn {_, code, data} ->
       case code do
         "o" ->
           Vt.feed(vt, data)

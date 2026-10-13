@@ -114,4 +114,37 @@ defmodule Asciinema.ZstdTest do
     assert Zstd.compress_file(input_path, output_path, compression_level: 9) == output_path
     assert Enum.join(Zstd.stream!(output_path, 8)) == plain
   end
+
+  test "decompress_stream/1 and decompress_stream_lines/2 decompress arbitrary chunk enumerables" do
+    plain = Enum.map_join(1..500, "\n", fn i -> "line-#{i}-payload" end) <> "\n"
+    compressed = IO.iodata_to_binary(:zstd.compress(plain))
+
+    chunks = for <<chunk::binary-size(23) <- compressed>>, do: chunk
+    rem_bytes = rem(byte_size(compressed), 23)
+
+    chunks =
+      if rem_bytes > 0 do
+        chunks ++ [binary_part(compressed, byte_size(compressed) - rem_bytes, rem_bytes)]
+      else
+        chunks
+      end
+
+    assert chunks |> Zstd.decompress_stream() |> Enum.join() == plain
+
+    lines = chunks |> Zstd.decompress_stream_lines() |> Enum.to_list()
+    assert length(lines) == 500
+    assert List.first(lines) == "line-1-payload\n"
+    assert List.last(lines) == "line-500-payload\n"
+  end
+
+  test "extract_lines/3 and decompress_stream_lines/2 raise LineTooLongError when line exceeds max_line_bytes" do
+    long_line = String.duplicate("x", 1024)
+    compressed = IO.iodata_to_binary(:zstd.compress(long_line))
+
+    assert_raise Zstd.LineTooLongError, fn ->
+      [compressed]
+      |> Zstd.decompress_stream_lines(256)
+      |> Stream.run()
+    end
+  end
 end

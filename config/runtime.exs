@@ -147,6 +147,45 @@ if config_env() in [:prod, :dev] do
     end
   end
 
+  if (bucket = env.("GCS_BUCKET")) || env.("FILE_STORE") == "gcs" do
+    config :asciinema, Asciinema.FileStore, adapter: Asciinema.FileStore.GCS
+
+    gcs_config = [
+      bucket: bucket,
+      path: env.("GCS_PATH") || "uploads/"
+    ]
+
+    gcs_config =
+      if endpoint = env.("GCS_ENDPOINT") do
+        Keyword.put(gcs_config, :storage_base_url, endpoint)
+      else
+        gcs_config
+      end
+
+    gcs_config =
+      if sa_email = env.("GCS_SERVICE_ACCOUNT_EMAIL") do
+        Keyword.put(gcs_config, :service_account_email, sa_email)
+      else
+        gcs_config
+      end
+
+    gcs_config =
+      if creds_json = env.("GCS_CREDENTIALS_JSON") || env.("GOOGLE_APPLICATION_CREDENTIALS_JSON") do
+        Keyword.put(gcs_config, :credentials_json, creds_json)
+      else
+        gcs_config
+      end
+
+    gcs_config =
+      if creds_path = env.("GOOGLE_APPLICATION_CREDENTIALS") do
+        Keyword.put(gcs_config, :credentials_path, creds_path)
+      else
+        gcs_config
+      end
+
+    config :asciinema, Asciinema.FileStore.GCS, gcs_config
+  end
+
   if db_pool_size = env.("DB_POOL_SIZE") do
     config :asciinema, Asciinema.Repo, pool_size: String.to_integer(db_pool_size)
   end

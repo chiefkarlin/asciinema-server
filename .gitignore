@@ -41,6 +41,7 @@ npm-debug.log
 
 /cache/
 /config/custom.exs
+/native/target/
 /priv/native/
 /uploads/
 /volumes/

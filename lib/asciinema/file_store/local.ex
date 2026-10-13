@@ -47,6 +47,33 @@ defmodule Asciinema.FileStore.Local do
     File.rm(full_path(path))
   end
 
+  @impl true
+  def direct_upload_supported?, do: false
+
+  @impl true
+  def direct_download_supported?, do: false
+
+  @impl true
+  def open_stream(path, opts \\ []) do
+    chunk_size = Keyword.get(opts, :chunk_size, 65_536)
+    abs_path = full_path(path)
+
+    if File.exists?(abs_path) do
+      {:ok, File.stream!(abs_path, chunk_size)}
+    else
+      {:error, :enoent}
+    end
+  end
+
+  @impl true
+  def stat_file(path) do
+    case File.stat(full_path(path)) do
+      {:ok, %{size: size}} -> {:ok, %{size: size, content_type: nil}}
+      {:error, :enoent} -> {:error, :enoent}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
   defp full_path(path), do: Path.join(base_path(), path)
 
   defp base_path, do: config(:path)

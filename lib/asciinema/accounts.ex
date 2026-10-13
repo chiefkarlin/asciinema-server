@@ -812,4 +812,89 @@ defmodule Asciinema.Accounts do
   def default_term_theme_name(user), do: user.term_theme_name || Themes.default_name()
 
   def default_font_family(user), do: user.term_font_family
+
+  def ensure_e2e_cli(token \\ "11111111-2222-4333-8444-555555555555") do
+    case Repo.get_by(Cli, token: token) |> Repo.preload(:user) do
+      nil ->
+        user = ensure_e2e_user()
+
+        %Cli{}
+        |> Changeset.change(%{token: token, user_id: user.id, revoked_at: nil})
+        |> Repo.insert!()
+
+      %Cli{user: %User{email: nil} = tmp_user} = cli ->
+        email =
+          if Repo.get_by(User, email: "e2e@example.com") do
+            "e2e-#{tmp_user.id}@example.com"
+          else
+            "e2e@example.com"
+          end
+
+        username =
+          if tmp_user.username && tmp_user.username != "" do
+            tmp_user.username
+          else
+            if find_user_by_username("e2etest"), do: "e2etest#{tmp_user.id}", else: "e2etest"
+          end
+
+        tmp_user
+        |> Changeset.change(%{
+          email: email,
+          username: username,
+          streaming_enabled: true,
+          stream_recording_enabled: true,
+          live_stream_limit: nil
+        })
+        |> Repo.update!()
+
+        if cli.revoked_at != nil do
+          cli |> Changeset.change(%{revoked_at: nil}) |> Repo.update!()
+        else
+          cli
+        end
+
+      %Cli{user: %User{} = user} = cli ->
+        if !user.streaming_enabled or !user.stream_recording_enabled do
+          user
+          |> Changeset.change(%{
+            streaming_enabled: true,
+            stream_recording_enabled: true,
+            live_stream_limit: nil
+          })
+          |> Repo.update!()
+        end
+
+        if cli.revoked_at != nil do
+          cli |> Changeset.change(%{revoked_at: nil}) |> Repo.update!()
+        else
+          cli
+        end
+    end
+  end
+
+  defp ensure_e2e_user do
+    case Repo.get_by(User, email: "e2e@example.com") do
+      %User{} = user ->
+        user
+        |> Changeset.change(%{
+          streaming_enabled: true,
+          stream_recording_enabled: true,
+          live_stream_limit: nil
+        })
+        |> Repo.update!()
+
+      nil ->
+        username = if find_user_by_username("e2etest"), do: "e2etest0", else: "e2etest"
+
+        %{
+          email: "e2e@example.com",
+          username: username,
+          streaming_enabled: true,
+          stream_recording_enabled: true,
+          live_stream_limit: nil
+        }
+        |> build_user()
+        |> Repo.insert!()
+    end
+  end
 end
