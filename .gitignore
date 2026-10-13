@@ -38,6 +38,7 @@ npm-debug.log
 .*
 !/.credo.exs
 !/.github/
+!/.iex.exs
 
 /cache/
 /config/custom.exs
