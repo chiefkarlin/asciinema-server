@@ -566,55 +566,76 @@ defmodule Asciinema.Recordings do
 
   def create_asciicast(user, local_path, attrs \\ %{}, params \\ %{})
       when is_binary(local_path) do
-    with {:ok, metadata} <- extract_metadata(local_path),
+    already_zstd = zstd_upload?(params) and Reader.compressed?(local_path)
+
+    with {:ok, metadata} <- extract_metadata_for_upload(local_path, already_zstd),
          :ok <- validate_not_empty(metadata),
          metadata = Map.put(metadata, :filename, normalize_filename(params)),
          changeset = build_asciicast(user, attrs, metadata, params),
          :ok <- validate_asciicast(changeset) do
-      if FileStore.direct_download_supported?() do
-        changeset =
-          change(changeset, %{
-            uncompressed_size: file_size(local_path),
-            compressed_size: nil,
-            compressed: false
-          })
+      cond do
+        already_zstd ->
+          changeset =
+            change(changeset, %{
+              uncompressed_size: nil,
+              compressed_size: file_size(local_path),
+              compressed: true
+            })
 
-        with {store_path, changeset} <- assign_store_path(changeset),
-             :ok <- save_file(local_path, store_path),
-             {:ok, asciicast} <- insert_asciicast_or_delete_file(changeset, store_path),
-             :ok <- schedule_bg_jobs(asciicast) do
-          {:ok, asciicast}
-        end
-      else
-        {compressed_path, changeset} = compress_file(local_path, changeset)
-
-        try do
           with {store_path, changeset} <- assign_store_path(changeset),
-               :ok <- save_file(compressed_path, store_path),
+               :ok <- save_file(local_path, store_path),
                {:ok, asciicast} <- insert_asciicast_or_delete_file(changeset, store_path),
                :ok <- schedule_bg_jobs(asciicast) do
             {:ok, asciicast}
           end
-        after
-          _ = File.rm(compressed_path)
-        end
+
+        FileStore.direct_download_supported?() ->
+          changeset =
+            change(changeset, %{
+              uncompressed_size: file_size(local_path),
+              compressed_size: nil,
+              compressed: false
+            })
+
+          with {store_path, changeset} <- assign_store_path(changeset),
+               :ok <- save_file(local_path, store_path),
+               {:ok, asciicast} <- insert_asciicast_or_delete_file(changeset, store_path),
+               :ok <- schedule_bg_jobs(asciicast) do
+            {:ok, asciicast}
+          end
+
+        true ->
+          {compressed_path, changeset} = compress_file(local_path, changeset)
+
+          try do
+            with {store_path, changeset} <- assign_store_path(changeset),
+                 :ok <- save_file(compressed_path, store_path),
+                 {:ok, asciicast} <- insert_asciicast_or_delete_file(changeset, store_path),
+                 :ok <- schedule_bg_jobs(asciicast) do
+              {:ok, asciicast}
+            end
+          after
+            _ = File.rm(compressed_path)
+          end
       end
     end
   end
 
   def create_asciicast_from_store(user, staged_store_path, attrs \\ %{}, params \\ %{})
       when is_binary(staged_store_path) do
+    is_zstd = zstd_upload?(params)
+
     with {:ok, %{size: byte_size}} <- FileStore.stat_file(staged_store_path),
          {:ok, chunk_stream} <- FileStore.open_stream(staged_store_path),
-         {:ok, metadata} <- extract_metadata_from_stream(chunk_stream),
+         {:ok, metadata} <- extract_metadata_from_stream(chunk_stream, compressed: is_zstd),
          :ok <- validate_not_empty(metadata),
          metadata = Map.put(metadata, :filename, normalize_filename(params)),
          changeset = build_asciicast(user, attrs, metadata, params),
          changeset =
            change(changeset, %{
-             uncompressed_size: byte_size,
-             compressed_size: nil,
-             compressed: false
+             uncompressed_size: if(is_zstd, do: nil, else: byte_size),
+             compressed_size: if(is_zstd, do: byte_size, else: nil),
+             compressed: is_zstd
            }),
          :ok <- validate_asciicast(changeset),
          {store_path, changeset} <- assign_store_path(changeset),
@@ -750,6 +771,27 @@ defmodule Asciinema.Recordings do
     File.stat!(path).size
   end
 
+  defp zstd_upload?(params) when is_map(params) do
+    case params["filename"] || params[:filename] do
+      f when is_binary(f) -> String.ends_with?(String.downcase(f), ".zst")
+      _ -> false
+    end
+  end
+
+  defp zstd_upload?(_), do: false
+
+  defp extract_metadata_for_upload(path, true) do
+    path
+    |> Reader.stream_lines!(compressed: true)
+    |> do_extract_metadata_from_lines()
+  rescue
+    Zstd.LineTooLongError -> {:error, :invalid_format}
+    RuntimeError -> {:error, :invalid_format}
+    ErlangError -> {:error, :invalid_format}
+  end
+
+  defp extract_metadata_for_upload(path, false), do: extract_metadata(path)
+
   def extract_metadata(path) when is_binary(path) do
     if Reader.compressed?(path) do
       {:error, :invalid_format}
@@ -761,15 +803,26 @@ defmodule Asciinema.Recordings do
   rescue
     Zstd.LineTooLongError -> {:error, :invalid_format}
     RuntimeError -> {:error, :invalid_format}
+    ErlangError -> {:error, :invalid_format}
   end
 
-  def extract_metadata_from_stream(chunk_enum, _byte_size \\ nil) do
+  def extract_metadata_from_stream(chunk_enum, opts \\ [])
+
+  def extract_metadata_from_stream(chunk_enum, opts) when is_list(opts) do
+    compressed = Keyword.get(opts, :compressed, false)
+    max_line_bytes = Keyword.get(opts, :max_line_bytes, Reader.max_line_bytes())
+
     chunk_enum
-    |> Reader.stream_lines!(compressed: false)
+    |> Reader.stream_lines!(compressed: compressed, max_line_bytes: max_line_bytes)
     |> do_extract_metadata_from_lines()
   rescue
     Zstd.LineTooLongError -> {:error, :invalid_format}
     RuntimeError -> {:error, :invalid_format}
+    ErlangError -> {:error, :invalid_format}
+  end
+
+  def extract_metadata_from_stream(chunk_enum, _byte_size) do
+    extract_metadata_from_stream(chunk_enum, [])
   end
 
   defp do_extract_metadata_from_lines(lines) do

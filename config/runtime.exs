@@ -147,7 +147,8 @@ if config_env() in [:prod, :dev] do
     end
   end
 
-  if (bucket = env.("GCS_BUCKET")) || env.("FILE_STORE") == "gcs" do
+  if ((bucket = env.("GCS_BUCKET")) || env.("FILE_STORE") == "gcs") &&
+       env.("FILE_STORE") not in ["local", "s3"] do
     config :asciinema, Asciinema.FileStore, adapter: Asciinema.FileStore.GCS
 
     gcs_config = [
