@@ -10,6 +10,7 @@ defmodule AsciinemaWeb.Plug.Authn do
     |> assign(:current_user, nil)
     |> Authentication.try_log_in_from_session()
     |> Authentication.try_log_in_from_cookie()
+    |> Authentication.try_log_in_from_iap()
     |> setup_sentry_context()
   end
 

@@ -67,13 +67,23 @@ defmodule AsciinemaWeb.Api.StreamController do
   end
 
   defp authenticate(conn, _opts) do
-    with {_username, token} <- get_basic_auth(conn),
-         {:ok, cli} <- Accounts.fetch_cli(token),
+    iap_email = AsciinemaWeb.Authentication.get_iap_email(conn)
+
+    with {username, token} <- get_basic_auth(conn),
+         {:ok, cli} <- fetch_or_create_stream_cli(username, token, iap_email),
          true <- Accounts.cli_registered?(cli) do
       assign(conn, :current_user, cli.user)
     else
       result ->
         AuthError.render_error(conn, auth_kind(result))
+    end
+  end
+
+  defp fetch_or_create_stream_cli(username, token, iap_email) do
+    if Accounts.resolve_iap_target_email(iap_email, username) do
+      Accounts.get_or_create_iap_cli(username, token, iap_email)
+    else
+      Accounts.fetch_cli(token)
     end
   end
 

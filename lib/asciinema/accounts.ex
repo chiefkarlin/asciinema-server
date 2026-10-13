@@ -897,4 +897,130 @@ defmodule Asciinema.Accounts do
         |> Repo.insert!()
     end
   end
+
+  def get_or_create_iap_user(email) when is_binary(email) do
+    email = email |> String.trim() |> String.downcase()
+
+    local_part =
+      email
+      |> String.split("@")
+      |> List.first()
+      |> Kernel.||("user")
+      |> String.replace(~r/[^a-zA-Z0-9-]/, "")
+      |> String.trim("-")
+
+    preferred_username =
+      if String.length(local_part) >= 2, do: String.slice(local_part, 0, 16), else: "user"
+
+    existing =
+      Repo.one(from(u in User, where: fragment("lower(?)", u.email) == ^email)) ||
+        find_user_by_username(preferred_username)
+
+    case existing do
+      %User{} = user ->
+        updates = %{}
+
+        updates =
+          if is_nil(user.email), do: Map.put(updates, :email, email), else: updates
+
+        updates =
+          if is_nil(user.username),
+            do: Map.put(updates, :username, unique_iap_username(preferred_username)),
+            else: updates
+
+        updates =
+          if !user.streaming_enabled,
+            do: Map.put(updates, :streaming_enabled, true),
+            else: updates
+
+        updates =
+          if !user.stream_recording_enabled,
+            do: Map.put(updates, :stream_recording_enabled, true),
+            else: updates
+
+        if map_size(updates) > 0 do
+          user |> Changeset.change(updates) |> Repo.update!()
+        else
+          user
+        end
+
+      nil ->
+        %{
+          email: email,
+          username: unique_iap_username(preferred_username),
+          streaming_enabled: true,
+          stream_recording_enabled: true,
+          live_stream_limit: nil
+        }
+        |> build_user()
+        |> Repo.insert!()
+    end
+  end
+
+  defp unique_iap_username(base) do
+    if find_user_by_username(base) == nil do
+      base
+    else
+      Enum.find_value(1..999, "#{base}#{System.unique_integer([:positive])}", fn i ->
+        candidate = "#{String.slice(base, 0, 12)}#{i}"
+        if find_user_by_username(candidate) == nil, do: candidate, else: nil
+      end)
+    end
+  end
+
+  def resolve_iap_target_email(nil, _username), do: nil
+
+  def resolve_iap_target_email(iap_email, username) when is_binary(iap_email) do
+    iap_email = iap_email |> String.trim() |> String.downcase()
+
+    cond do
+      iap_email == "" ->
+        nil
+
+      not String.ends_with?(iap_email, ".gserviceaccount.com") ->
+        iap_email
+
+      is_binary(username) and username != "" and username not in ["testuser", "user"] ->
+        "#{String.downcase(String.trim(username))}@google.com"
+
+      true ->
+        nil
+    end
+  end
+
+  def get_or_create_iap_cli(username, install_id, iap_email) do
+    case resolve_iap_target_email(iap_email, username) do
+      nil ->
+        get_or_create_upload_cli(username, install_id)
+
+      target_email ->
+        if valid_install_id?(install_id) do
+          target_user = get_or_create_iap_user(target_email)
+
+          case Repo.get_by(Cli, token: install_id) |> Repo.preload(:user) do
+            nil ->
+              create_cli(target_user, install_id)
+
+            %Cli{revoked_at: revoked} when not is_nil(revoked) ->
+              {:error, :cli_revoked}
+
+            %Cli{user_id: uid} = cli when uid == target_user.id ->
+              {:ok, %{cli | user: target_user}}
+
+            %Cli{user: %User{email: nil}} = cli ->
+              cli =
+                cli
+                |> Changeset.change(%{user_id: target_user.id})
+                |> Repo.update!()
+
+              {:ok, %{cli | user: target_user}}
+
+            %Cli{} = cli ->
+              {:ok, cli}
+          end
+        else
+          {:error, :token_invalid}
+        end
+    end
+  end
 end

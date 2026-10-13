@@ -39,6 +39,34 @@ defmodule AsciinemaWeb.Authentication do
 
   def try_log_in_from_cookie(conn), do: conn
 
+  def try_log_in_from_iap(%Conn{assigns: %{current_user: nil}} = conn) do
+    with email when is_binary(email) <- get_iap_email(conn),
+         false <- String.ends_with?(email, ".gserviceaccount.com") do
+      user = Accounts.get_or_create_iap_user(email)
+      log_in(conn, user)
+    else
+      _ -> conn
+    end
+  end
+
+  def try_log_in_from_iap(conn), do: conn
+
+  def get_iap_email(conn) do
+    case get_req_header(conn, "x-goog-authenticated-user-email") do
+      [raw | _] when is_binary(raw) ->
+        email =
+          raw
+          |> String.trim()
+          |> String.replace_prefix("accounts.google.com:", "")
+          |> String.downcase()
+
+        if email != "" and String.contains?(email, "@"), do: email, else: nil
+
+      _ ->
+        nil
+    end
+  end
+
   def require_current_user(%Conn{assigns: %{current_user: %User{}}} = conn, _) do
     conn
   end
