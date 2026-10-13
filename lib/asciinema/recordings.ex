@@ -1066,27 +1066,31 @@ defmodule Asciinema.Recordings do
   def compress_asciicast(%Asciicast{compressed: true} = asciicast), do: {:ok, asciicast}
 
   def compress_asciicast(%Asciicast{} = asciicast) do
-    asciicast = Repo.preload(asciicast, :user)
-    old_store_path = asciicast.path
-    source_path = get_cast_path!(asciicast)
-    {zst_path, changeset} = compress_file(source_path, asciicast)
-
-    try do
-      {new_store_path, changeset} = assign_store_path(changeset)
-      :ok = save_file(zst_path, new_store_path)
+    if FileStore.direct_download_supported?() do
+      {:ok, asciicast}
+    else
+      asciicast = Repo.preload(asciicast, :user)
+      old_store_path = asciicast.path
+      source_path = get_cast_path!(asciicast)
+      {zst_path, changeset} = compress_file(source_path, asciicast)
 
       try do
-        asciicast = Repo.update!(changeset)
-        maybe_delete_file(old_store_path)
+        {new_store_path, changeset} = assign_store_path(changeset)
+        :ok = save_file(zst_path, new_store_path)
 
-        {:ok, asciicast}
-      rescue
-        error ->
-          maybe_delete_file(new_store_path)
-          reraise error, __STACKTRACE__
+        try do
+          asciicast = Repo.update!(changeset)
+          maybe_delete_file(old_store_path)
+
+          {:ok, asciicast}
+        rescue
+          error ->
+            maybe_delete_file(new_store_path)
+            reraise error, __STACKTRACE__
+        end
+      after
+        _ = File.rm(zst_path)
       end
-    after
-      _ = File.rm(zst_path)
     end
   end
 
@@ -1120,12 +1124,24 @@ defmodule Asciinema.Recordings do
     |> Repo.update()
   end
 
+  @max_snapshot_feed_bytes 16 * 1024 * 1024
+  @max_fts_feed_bytes 16 * 1024 * 1024
+
   def generate_snapshot(output_stream, cols, rows, secs) do
     {:ok, vt} = Vt.new(cols, rows, 0)
 
     output_stream
     |> Stream.take_while(&frame_before_or_at?(&1, secs))
-    |> Enum.each(fn {_, text} -> Vt.feed(vt, text) end)
+    |> Enum.reduce_while(0, fn {_, text}, bytes_fed ->
+      Vt.feed(vt, text)
+      next_bytes = bytes_fed + byte_size(text)
+
+      if next_bytes >= @max_snapshot_feed_bytes do
+        {:halt, next_bytes}
+      else
+        {:cont, next_bytes}
+      end
+    end)
 
     Vt.dump_screen(vt)
   end
@@ -1172,20 +1188,27 @@ defmodule Asciinema.Recordings do
     {:ok, fts} = Fts.new(cols, rows)
 
     events
-    |> Stream.each(fn {_, code, data} ->
+    |> Enum.reduce_while(0, fn {_, code, data}, bytes_fed ->
       case code do
         "o" ->
           Fts.feed(fts, data)
+          next_bytes = bytes_fed + byte_size(data)
+
+          if next_bytes >= @max_fts_feed_bytes do
+            {:halt, next_bytes}
+          else
+            {:cont, next_bytes}
+          end
 
         "r" ->
           {cols, rows} = data
           Fts.resize(fts, cols, rows)
+          {:cont, bytes_fed}
 
         _ ->
-          :ok
+          {:cont, bytes_fed}
       end
     end)
-    |> Stream.run()
 
     Fts.dump(fts)
   end

@@ -99,22 +99,27 @@ defmodule Asciinema.GcsTestHelpers do
            conn,
            state_pid
          ) do
-      if conn.query_params["uploadType"] == "resumable" do
-        if Agent.get(state_pid, & &1.resumable_fail) do
-          send_resp(conn, 500, "resumable error")
-        else
-          name = conn.query_params["name"]
-          scheme = Atom.to_string(conn.scheme)
+      case conn.query_params["uploadType"] do
+        "resumable" ->
+          if Agent.get(state_pid, & &1.resumable_fail) do
+            send_resp(conn, 500, "resumable error")
+          else
+            name = conn.query_params["name"]
+            scheme = Atom.to_string(conn.scheme)
 
-          session_url =
-            "#{scheme}://#{conn.host}:#{conn.port}/upload/storage/v1/b/#{bucket}/o?uploadType=resumable&name=#{URI.encode_www_form(name)}&upload_id=session-123"
+            session_url =
+              "#{scheme}://#{conn.host}:#{conn.port}/upload/storage/v1/b/#{bucket}/o?uploadType=resumable&name=#{URI.encode_www_form(name)}&upload_id=session-123"
 
-          conn
-          |> put_resp_header("location", session_url)
-          |> send_resp(200, "")
-        end
-      else
-        send_resp(conn, 400, "unsupported uploadType")
+            conn
+            |> put_resp_header("location", session_url)
+            |> send_resp(200, "")
+          end
+
+        "media" ->
+          store_uploaded_object(conn, bucket, state_pid)
+
+        _ ->
+          send_resp(conn, 400, "unsupported uploadType")
       end
     end
 
@@ -124,27 +129,7 @@ defmodule Asciinema.GcsTestHelpers do
            conn,
            state_pid
          ) do
-      {:ok, body, conn} = read_full_body(conn, "")
-      name = conn.query_params["name"]
-      content_type = get_req_header(conn, "content-type") |> List.first("application/octet-stream")
-
-      Agent.update(state_pid, fn state ->
-        put_in(state, [:objects, {bucket, name}], %{
-          data: body,
-          size: byte_size(body),
-          content_type: content_type
-        })
-      end)
-
-      send_resp(
-        conn,
-        200,
-        Jason.encode!(%{
-          "name" => name,
-          "size" => Integer.to_string(byte_size(body)),
-          "contentType" => content_type
-        })
-      )
+      store_uploaded_object(conn, bucket, state_pid)
     end
 
     defp handle_request(
@@ -252,6 +237,30 @@ defmodule Asciinema.GcsTestHelpers do
             )
           end
       end
+    end
+
+    defp store_uploaded_object(conn, bucket, state_pid) do
+      {:ok, body, conn} = read_full_body(conn, "")
+      name = conn.query_params["name"]
+      content_type = get_req_header(conn, "content-type") |> List.first("application/octet-stream")
+
+      Agent.update(state_pid, fn state ->
+        put_in(state, [:objects, {bucket, name}], %{
+          data: body,
+          size: byte_size(body),
+          content_type: content_type
+        })
+      end)
+
+      send_resp(
+        conn,
+        200,
+        Jason.encode!(%{
+          "name" => name,
+          "size" => Integer.to_string(byte_size(body)),
+          "contentType" => content_type
+        })
+      )
     end
 
     defp read_full_body(conn, acc) do

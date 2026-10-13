@@ -181,7 +181,7 @@ defmodule Asciinema.FileStore.GCS do
         recv_timeout: recv_timeout()
       ]
 
-      case :hackney.request(:put, url, headers, :stream, options) do
+      case :hackney.request(:post, url, headers, :stream, options) do
         {:ok, client_ref} ->
           stream_file_to_hackney(client_ref, src_local_path)
 
@@ -377,54 +377,177 @@ defmodule Asciinema.FileStore.GCS do
   end
 
   @doc """
-  Opens an HTTP GET connection via `:hackney` and returns `{:ok, Enumerable.t()}`
-  that lazily streams response body chunks via `Stream.resource/3`.
+  Opens an HTTP GET connection via `:hackney` with `async: :once` (`{active, once}`
+  socket framing) and returns `{:ok, Enumerable.t()}` that lazily streams response
+  body chunks via `Stream.resource/3` in bounded memory regardless of `Content-Length`.
   Verifies HTTP 200 status upfront before returning `{:ok, stream}` so 404s
   immediately return `{:error, :enoent}`.
   """
   def stream_http_url(url, opts \\ []) do
     headers = Keyword.get(opts, :headers, [{"accept-encoding", "identity"}])
+    connect_timeout = Keyword.get(opts, :connect_timeout, connect_timeout())
+    recv_timeout = Keyword.get(opts, :recv_timeout, recv_timeout())
+    max_redirects = Keyword.get(opts, :max_redirects, 5)
 
     options = [
-      connect_timeout: Keyword.get(opts, :connect_timeout, connect_timeout()),
-      recv_timeout: Keyword.get(opts, :recv_timeout, recv_timeout()),
-      follow_redirect: true
+      connect_timeout: connect_timeout,
+      recv_timeout: recv_timeout,
+      follow_redirect: true,
+      async: :once
     ]
 
     case :hackney.request(:get, url, headers, <<>>, options) do
-      {:ok, 200, _resp_headers, client_ref} ->
-        stream =
-          Stream.resource(
-            fn -> client_ref end,
-            fn ref ->
-              case :hackney.stream_body(ref) do
-                {:ok, chunk} ->
-                  {[chunk], ref}
-
-                :done ->
-                  {:halt, ref}
-
-                {:error, reason} ->
-                  raise "GCS HTTP stream error: #{inspect(reason)}"
-              end
-            end,
-            fn ref ->
-              :hackney.close(ref)
-            end
-          )
-
-        {:ok, stream}
-
-      {:ok, 404, _resp_headers, client_ref} ->
-        :hackney.close(client_ref)
-        {:error, :enoent}
-
-      {:ok, status, _resp_headers, client_ref} ->
-        {:ok, body} = :hackney.body(client_ref)
-        {:error, {:http_status, status, body}}
+      {:ok, client_ref} ->
+        await_stream_status(client_ref, url, opts, recv_timeout, max_redirects)
 
       {:error, reason} ->
         {:error, reason}
+    end
+  end
+
+  defp await_stream_status(ref, url, opts, recv_timeout, max_redirects) do
+    receive do
+      {:hackney_response, ^ref, {:status, status, _reason}} ->
+        case await_stream_headers(ref, recv_timeout) do
+          {:ok, _resp_headers} ->
+            handle_stream_status(ref, status, recv_timeout)
+
+          {:error, reason} ->
+            :hackney.close(ref)
+            flush_hackney_messages(ref)
+            {:error, reason}
+        end
+
+      {:hackney_response, ^ref, {:redirect, to_url, _headers}} ->
+        flush_hackney_messages(ref)
+
+        if max_redirects > 0 do
+          next_url = URI.merge(url, to_url) |> URI.to_string()
+          headers = Keyword.get(opts, :headers, [{"accept-encoding", "identity"}])
+
+          next_headers =
+            if String.contains?(next_url, "X-Goog-Algorithm=") or
+                 URI.parse(next_url).host != URI.parse(url).host do
+              Enum.reject(headers, fn {k, _v} -> String.downcase(k) == "authorization" end)
+            else
+              headers
+            end
+
+          next_opts =
+            opts
+            |> Keyword.put(:headers, next_headers)
+            |> Keyword.put(:max_redirects, max_redirects - 1)
+
+          stream_http_url(next_url, next_opts)
+        else
+          {:error, :too_many_redirects}
+        end
+
+      {:hackney_response, ^ref, {:error, reason}} ->
+        :hackney.close(ref)
+        flush_hackney_messages(ref)
+        {:error, reason}
+    after
+      recv_timeout ->
+        :hackney.close(ref)
+        flush_hackney_messages(ref)
+        {:error, :timeout}
+    end
+  end
+
+  defp await_stream_headers(ref, recv_timeout) do
+    :hackney.stream_next(ref)
+
+    receive do
+      {:hackney_response, ^ref, {:headers, resp_headers}} ->
+        {:ok, resp_headers}
+
+      {:hackney_response, ^ref, {:error, reason}} ->
+        {:error, reason}
+    after
+      recv_timeout ->
+        {:error, :timeout}
+    end
+  end
+
+  defp handle_stream_status(ref, 200, recv_timeout) do
+    stream =
+      Stream.resource(
+        fn -> ref end,
+        fn
+          :done ->
+            {:halt, :done}
+
+          active_ref ->
+            :hackney.stream_next(active_ref)
+
+            receive do
+              {:hackney_response, ^active_ref, :done} ->
+                {:halt, :done}
+
+              {:hackney_response, ^active_ref, chunk} when is_binary(chunk) ->
+                {[chunk], active_ref}
+
+              {:hackney_response, ^active_ref, {:error, reason}} ->
+                raise "GCS HTTP stream error: #{inspect(reason)}"
+            after
+              recv_timeout ->
+                raise "GCS HTTP stream error: :timeout"
+            end
+        end,
+        fn
+          :done ->
+            flush_hackney_messages(ref)
+
+          active_ref ->
+            :hackney.close(active_ref)
+            flush_hackney_messages(active_ref)
+        end
+      )
+
+    {:ok, stream}
+  end
+
+  defp handle_stream_status(ref, 404, _recv_timeout) do
+    :hackney.close(ref)
+    flush_hackney_messages(ref)
+    {:error, :enoent}
+  end
+
+  defp handle_stream_status(ref, status, recv_timeout) do
+    body = read_async_error_body(ref, recv_timeout, [], 0)
+    :hackney.close(ref)
+    flush_hackney_messages(ref)
+    {:error, {:http_status, status, body}}
+  end
+
+  defp read_async_error_body(_ref, _recv_timeout, acc, size) when size >= 65_536 do
+    acc |> Enum.reverse() |> IO.iodata_to_binary()
+  end
+
+  defp read_async_error_body(ref, recv_timeout, acc, size) do
+    :hackney.stream_next(ref)
+
+    receive do
+      {:hackney_response, ^ref, :done} ->
+        acc |> Enum.reverse() |> IO.iodata_to_binary()
+
+      {:hackney_response, ^ref, chunk} when is_binary(chunk) ->
+        read_async_error_body(ref, recv_timeout, [chunk | acc], size + byte_size(chunk))
+
+      {:hackney_response, ^ref, {:error, _reason}} ->
+        acc |> Enum.reverse() |> IO.iodata_to_binary()
+    after
+      recv_timeout ->
+        acc |> Enum.reverse() |> IO.iodata_to_binary()
+    end
+  end
+
+  defp flush_hackney_messages(ref) do
+    receive do
+      {:hackney_response, ^ref, _} -> flush_hackney_messages(ref)
+    after
+      0 -> :ok
     end
   end
 
